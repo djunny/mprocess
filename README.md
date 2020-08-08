@@ -1,5 +1,5 @@
 # mprocess
-Multi process task execution based on swoole, support queue/lock 
+Multi process task execution based on swoole, support queue/lock/atomic
 
 ### Installation
 
@@ -93,7 +93,7 @@ $process->loop(function ($task_data) use ($process) {
 ```
 
 
-### locker && incr
+### locker && atomic
 
 ```
 
