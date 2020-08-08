@@ -1,0 +1,34 @@
+{
+  "name": "zv/mprocess",
+  "type": "library",
+  "description": "Multi process task execution based on swoole/基于 swoole 的多任务进程管理",
+  "keywords": [
+    "php",
+    "multi process",
+    "swoole",
+    "task execution",
+    "performance",
+    "queue",
+    "multi task",
+    "easy",
+    "flexible"
+  ],
+  "homepage": "https://github.com/djunny/mprocess",
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "djunny",
+      "email": "github@djunny.com",
+      "homepage": "http://djunny.com",
+      "role": "Developer"
+    }
+  ],
+  "require": {
+    "php": ">=7.0.0"
+  },
+  "autoload": {
+    "psr-4": {
+      "ZV\\": "src"
+    }
+  }
+}
