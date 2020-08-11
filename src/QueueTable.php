@@ -42,6 +42,18 @@ class QueueTable extends Table implements \Countable, \ArrayAccess
         $this->locker     = new Lock(SWOOLE_MUTEX);
     }
 
+    /**
+     * destroy memory
+     */
+    public function __destruct() {
+        $this->max_atomic = NULL;
+        $this->min_atomic = NULL;
+        $this->meta_table->destroy();
+        $this->locker->destroy();
+        $this->destroy();
+    }
+
+
     public function get_size() {
         return $this->memorySize + $this->meta_table->memorySize;
     }

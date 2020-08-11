@@ -40,6 +40,14 @@ class MProcess implements \Countable, \ArrayAccess
     }
 
     /**
+     * destroy memory
+     */
+    public function __destruct() {
+        $this->atomic_table->destroy();
+        $this->locker->destroy();
+    }
+
+    /**
      * init table
      */
     private function init() {
@@ -48,7 +56,6 @@ class MProcess implements \Countable, \ArrayAccess
         $this->atomic_table = new Table($this->table_size);
         $this->atomic_table->column('id', Table::TYPE_INT, 4);
         $this->atomic_table->create();
-
         // lock
         $this->locker = new Lock();
     }
