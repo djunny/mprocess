@@ -43,8 +43,8 @@ class MProcess implements \Countable, \ArrayAccess
      * destroy memory
      */
     public function __destruct() {
-        $this->atomic_table->destroy();
-        $this->locker->destroy();
+        $this->atomic_table && $this->atomic_table->destroy();
+        $this->locker && $this->locker->destroy();
     }
 
     /**
