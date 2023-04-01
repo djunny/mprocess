@@ -10,25 +10,38 @@ use Swoole\Process;
 use Swoole\Table;
 use Swoole\Lock;
 
-class MProcess implements \Countable, \ArrayAccess
-{
+class MProcess implements \Countable, \ArrayAccess {
     private $process      = 5;
     private $process_list = [];
-    private $master_id    = 0;
+    private $master_id;
+
     /**@var QueueTable */
-    private $table      = NULL;
+    private $table;
+    /**@var Table */
+    private $atomic_table;
+
     private $table_size = 1024;
     private $data_size  = 1024;
-    /**@var Table */
-    private $atomic_table = [];
     /**@var Lock */
     private $locker = NULL;
+    /**
+     * @var array event
+     */
+    private $events = [];
+
+    // process timeout
+    const EVENT_TIMEOUT = 'timeout';
+    // process done
+    const EVENT_DONE = 'done';
+    // process init(start in first child process)
+    const EVENT_INIT = 'init';
+
 
     /**
      * MProcess constructor.
      *
      * @param int $process    process count
-     * @param int $table_size queue table size
+     * @param int $table_size queue table initial size
      * @param int $data_size  max-length for data(after json_encode)
      */
     public function __construct($process = 5, $table_size = -1, $data_size = 1024) {
@@ -40,14 +53,6 @@ class MProcess implements \Countable, \ArrayAccess
     }
 
     /**
-     * destroy memory
-     */
-    public function __destruct() {
-        $this->atomic_table && $this->atomic_table->destroy();
-        $this->locker && $this->locker->destroy();
-    }
-
-    /**
      * init table
      */
     private function init() {
@@ -56,8 +61,80 @@ class MProcess implements \Countable, \ArrayAccess
         $this->atomic_table = new Table($this->table_size);
         $this->atomic_table->column('id', Table::TYPE_INT, 4);
         $this->atomic_table->create();
+
         // lock
         $this->locker = new Lock();
+    }
+
+
+    /**
+     * bind event
+     *
+     * @param $event
+     * @param $callback
+     *
+     * @return $this
+     */
+    public function on($event, $callback) {
+        $this->events[$event] = $callback;
+        return $this;
+    }
+
+    /**
+     * on timeout
+     *
+     * @param $callback
+     *
+     * @return $this
+     */
+    public function on_timeout($callback) {
+        return $this->on(self::EVENT_TIMEOUT, $callback);
+    }
+
+    /**
+     * on init process
+     *
+     * @param $callback
+     *
+     * @return $this
+     */
+    public function on_init($callback) {
+        return $this->on(self::EVENT_INIT, $callback);
+    }
+
+    /**
+     * on done
+     *
+     * @param $callback
+     *
+     * @return $this
+     */
+    public function on_done($callback) {
+        return $this->on(self::EVENT_DONE, $callback);
+    }
+
+    /**
+     * has event
+     *
+     * @param $event
+     *
+     * @return bool
+     */
+    public function has($event) {
+        return isset($this->events[$event]);
+    }
+
+    /**
+     * trigger event
+     *
+     * @param $event
+     *
+     * @return void
+     */
+    private function trigger($event, ...$args) {
+        if (isset($this->events[$event])) {
+            call_user_func_array($this->events[$event], $args);
+        }
     }
 
     /**
@@ -70,13 +147,69 @@ class MProcess implements \Countable, \ArrayAccess
     }
 
     /**
-     * get left process count
+     * get left process
      *
-     * @return int
+     * @return array
      */
     function get_left_process() {
-        return count($this->process_list);
+        if (!$this->process_list) {
+            return [];
+        }
+        $ret = Process::wait(false);
+        $pid = $ret['pid'] ?: FALSE;
+        if ($pid && $this->process_list[$pid]) {
+            // Close Event
+            unset($this->process_list[$pid]);
+        }
+        return $this->process_list;
     }
+
+    /**
+     * wait all process
+     *
+     * @param int      $timout second wait
+     * @param \Closure $timeout_callback
+     *
+     * @return $this
+     */
+    function wait($timeout = -1, $timeout_callback = NULL) {
+        if (!$this->process_list) {
+            return $this;
+        }
+        if ($timeout_callback) {
+            $this->on(static::EVENT_TIMEOUT, $timeout_callback);
+        }
+        $start_time = time();
+        while (true) {
+            $ret = Process::wait($timeout == -1 ? true : false);
+            if ($timeout > 0 && time() - $start_time > $timeout) {
+                // kill all process
+                /**@var Process $process */
+                foreach ($this->process_list as $pid => $process) {
+                    Process::kill($pid, SIGKILL);
+                    $process->exit(SIGKILL);
+                }
+                $this->trigger(static::EVENT_TIMEOUT, $this);
+                break;
+            }
+            if ($ret === false) {
+                continue;
+            }
+            $pid = $ret['pid'] ?: FALSE;
+            if ($pid && $this->process_list[$pid]) {
+                // Close Event
+                unset($this->process_list[$pid]);
+            }
+            if (!$this->process_list) {
+                break;
+            }
+            usleep(500000);
+        }
+        // done
+        $this->trigger(static::EVENT_DONE, $this);
+        return $this;
+    }
+
 
     /**
      *  task loop while all of done
@@ -96,7 +229,7 @@ class MProcess implements \Countable, \ArrayAccess
                         $is_done = 1;
                     }
                     // lower CPU time
-                    usleep(100);
+                    usleep(500000);
                     continue;
                 }
                 $callback($task_data, $index, $count);
@@ -105,27 +238,20 @@ class MProcess implements \Countable, \ArrayAccess
     }
 
     /**
-     * wait all process
+     * lock to call
      *
-     * @return $this
+     * @param $callback
      */
-    function wait() {
-        if (!$this->process_list) {
-            return $this;
-        }
-        //监听到进程退出了
-        while ($ret = Process::wait(TRUE)) {
-            if (!$this->process_list) {
-                break;
+    public function lock($callback) {
+        try {
+            while (!$this->locker->trylock()) {
+                usleep(500000);
             }
-            $pid = $ret['pid'] ?: FALSE;
-            if ($pid && $this->process_list[$pid]) {
-                // Close Event
-                unset($this->process_list[$pid]);
-            }
-            usleep(1000);
+            $res = $callback();
+        } finally {
+            $this->locker->unlock();
         }
-        return $this;
+        return $res;
     }
 
     /**
@@ -137,37 +263,38 @@ class MProcess implements \Countable, \ArrayAccess
      */
     function do($callback) {
         $this->process_list = [];
+        $that               = $this;
         for ($i = 0; $i < $this->process; $i++) {
             $process                  = $this->create_process($i, $this->process,
-                function ($index, $count, $process) use ($callback) {
+                function ($index, $count, $process) use ($callback, $that) {
+                    // create init callback
+                    if ($index == 0) {
+                        $that->incr('_init');
+                        try {
+                            $this->trigger(static::EVENT_INIT, $that);
+                        } catch (Exception $e) {
+                            throw $e;
+                        } finally {
+                            $that->incr('_init');
+                        }
+                    } elseif ($that->has(static::EVENT_INIT)) {
+                        // wait index=0 process init
+                        while ($that->atomic('_init') !== 2) {
+                            usleep(500000);
+                        }
+                    }
+
                     // auto set log prefix
                     if (class_exists('log')) {
                         \log::$prefix = $index . '/' . $count;
                     }
-                    $callback($index, $count, $process);
+                    $callback($index, $count, $that);
                     $process->exit();
                 });
             $pid                      = $process->start();
             $this->process_list[$pid] = $process;
         }
         return $this;
-    }
-
-    /**
-     * lock to call
-     *
-     * @param $callback
-     */
-    public function lock($callback) {
-        try {
-            $this->locker->lock();
-            //log::info('EnLock');
-            $res = $callback();
-        } finally {
-            $this->locker->unlock();
-            //log::info('UNLock');
-        }
-        return $res;
     }
 
     /**
@@ -205,7 +332,7 @@ class MProcess implements \Countable, \ArrayAccess
      * @inheritDoc
      */
     public function offsetSet($offset, $value) {
-        return $this->table->push($value, $offset);
+        return $this->table[$offset] = $value;
     }
 
     /**
@@ -250,7 +377,7 @@ class MProcess implements \Countable, \ArrayAccess
      * @return string
      */
     private function encode_key($key) {
-        return ':' . $key;// 防止 key 是数字
+        return ':' . $key;// keep string
     }
 
     /**
@@ -262,7 +389,7 @@ class MProcess implements \Countable, \ArrayAccess
      * @return bool
      */
     function incr($key, $incrby = 1) {
-        return $this->atomic_table->incr($this->encode_key($key), 'id', $incrby);
+        return (int)$this->atomic_table->incr($this->encode_key($key), 'id', $incrby);
     }
 
     /**
@@ -272,7 +399,7 @@ class MProcess implements \Countable, \ArrayAccess
      * @param int $incrby
      */
     function decr($key, $incrby = 1) {
-        return $this->atomic_table->decr($this->encode_key($key), 'id', $incrby);
+        return (int)$this->atomic_table->decr($this->encode_key($key), 'id', $incrby);
     }
 
     /**
@@ -283,13 +410,24 @@ class MProcess implements \Countable, \ArrayAccess
      * @return array|bool|string
      */
     function atomic($key) {
-        return $this->atomic_table->get($this->encode_key($key), 'id');
+        return (int)$this->atomic_table->get($this->encode_key($key), 'id');
+    }
+
+    /**
+     * remove atomic value
+     *
+     * @param $key
+     *
+     * @return array|bool|string
+     */
+    function atomic_del($key) {
+        return (int)$this->atomic_table->del($this->encode_key($key));
     }
 
     /**
      * @inheritDoc
      */
     public function count() {
-        return count($this->table);
+        return $this->table->count();
     }
 }

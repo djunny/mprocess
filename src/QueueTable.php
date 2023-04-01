@@ -11,233 +11,156 @@ namespace ZV;
 use Swoole\Table;
 use Swoole\Atomic;
 use Swoole\Lock;
+use Countable;
+use ArrayAccess;
 
-class QueueTable extends Table implements \Countable, \ArrayAccess
-{
-
-    /**@var Table */
-    private $meta_table;
-    /**@var Atomic */
-    private $max_atomic;
-    /**@var Atomic */
-    private $min_atomic;
-    /**@vcar Lock */
+class QueueTable implements Countable, ArrayAccess {
+    private $table;
+    private $head;
+    private $tail;
+    private $ext_size;
     private $locker;
+    private $data_size;
+    private $size_cmp;
+    private $size_set;
+    private $size_max;
+    private $pow;
+    private $conflict = 1.5;
 
     public function __construct($size, $data_size) {
-        parent::__construct($size);
-        // id 是 meta 表自增的(4+4+464+size);
-        //$this->column('id', Table::TYPE_INT, 4);
-        $this->column('data', Table::TYPE_STRING, $data_size);
-        $this->create();
-        // meta table
-        $this->meta_table = new Table($size * 2);
-        $this->meta_table->column('id', Table::TYPE_INT, 8);
-        //$this->meta_table->column('prev', Table::TYPE_INT, 4);
-        $this->meta_table->column('key', Table::TYPE_STRING, 64);
-        $this->meta_table->create();
-
-        $this->max_atomic = new Atomic(0);
-        $this->min_atomic = new Atomic(0);
-        $this->locker     = new Lock(SWOOLE_MUTEX);
+        $this->data_size = $data_size;
+        $this->table     = $this->createTable($size);
+        $this->head      = new Atomic(0);
+        $this->tail      = new Atomic(0);
+        $this->ext_size  = new Atomic(0);
+        $this->locker    = new Lock(SWOOLE_MUTEX);
     }
 
-    /**
-     * destroy memory
-     */
-    public function __destruct() {
-        $this->max_atomic = NULL;
-        $this->min_atomic = NULL;
-        $this->meta_table->destroy();
-        $this->locker->destroy();
-        $this->destroy();
+    public function count() {
+        return $this->table->count() - $this->ext_size->get(); // 减去 head 和 tail 两个元素
     }
 
-
-    public function get_size() {
-        return $this->memorySize + $this->meta_table->memorySize;
+    private function createTable($size) {
+        // keep size is power of 2
+        $this->pow = ceil(log($size, 2));
+        $size      = 2 ** $this->pow;
+        $this->size_set = $size;
+        $this->size_cmp = $size * 0.7;
+        $this->size_max = ceil($size * $this->conflict);
+        $table          = new Table($this->size_max);
+        $table->column('data', Table::TYPE_STRING, $this->data_size);
+        //$table->column('tail', Table::TYPE_INT);
+        $table->create();
+        // copy table old data
+        if ($this->table) {
+            foreach ($this->table as $key => $item) {
+                $table->set($key, $item);
+            }
+            //log::info('create new table, copy old data:' . $this->size_max, round(memory_get_usage(true) / 1024 / 1024, 2) . 'M');
+        }
+        return $table;
     }
 
-    private function incr_max_id() {
-        $res = $this->max_atomic->add(1);
-        return $res;
+    public function push($data) {
+        $tail = $this->bulk(function () use ($data) {
+            $tail = $this->tail->add();
+            if ($this->table->count() >= $this->size_cmp) {
+                // auto extend table size
+                $this->table = $this->createTable($this->size_max);
+            }
+            return $tail;
+        });
+        $key  = $this->queueIndex($tail);
+        if (!$this->table->set($key, ['data' => json_encode($data, true)])) {
+            // log::info($this->table->count(), $this->size_max);
+            throw new Exception('error:' . error_get_last()['message']);
+        }
+        return $tail;
     }
 
-    private function decr_max_id() {
-        return $this->max_atomic->sub(1);
+    public function pop() {
+        return $this->bulk(function () {
+            $tail = $this->tail->get();
+            // log::info('tail: ' . $tail);
+            if ($tail > 0) {
+                $key    = $this->queueIndex($tail);
+                $result = $this->table->get($key, 'data');
+                if ($result === false) {
+                    return null;
+                }
+                $this->table->del($key);
+                $this->tail->sub();
+                return $result === false ? $result : json_decode($result, true);
+            }
+            return null;
+        });
     }
 
-    private function incr_min_id() {
-        return $this->min_atomic->add(1);
+    public function shift() {
+        return $this->bulk(function () {
+            $head = $this->head->get();
+            $tail = $this->tail->get();
+            if ($head == $tail) {
+                return null; // empty queue
+            }
+            $key   = $this->queueIndex($head + 1);
+            $value = $this->table->get($key);
+            if ($value === false) {
+                return null;
+            }
+            $this->head->add(); // move head pointer
+            $this->table->del($key); // remove element
+            return json_decode($value['data'], true);
+        });
     }
 
-    private function get_max_id() {
-        return $this->max_atomic->get();
-    }
-
-    private function get_min_id() {
-        return $this->min_atomic->get();
-    }
-
-
-    private function encode_key($key) {
-        return ':' . $key;// 防止 key 是数字
-    }
-
-    private function do_lock(\Closure $call) {
+    public function bulk($callback) {
         try {
-            $this->locker->lock();
-            //log::info('EnLock');
-            $res = $call();
+            while (!$this->locker->trylock()) {
+                usleep(1000);
+            }
+            $res = $callback();
         } finally {
             $this->locker->unlock();
-            //log::info('UNLock');
         }
         return $res;
     }
 
-    /**
-     * do lock
-     *
-     * @param $callback
-     *
-     * @return mixed
-     */
-    public function lock($callback) {
-        return $this->do_lock($callback);
+    public function offsetExists($key) {
+        $index = $this->keyIndex($key);
+        return $this->table->exists($index);
     }
 
-    public function push($data, $key = '') {
-        $data = json_encode($data, 320);
-        return $this->do_lock(function () use ($data, $key) {
-            $max_id = $this->incr_max_id();
-            //log::info('incr', $max_id);
-            $key      = $key ?: $max_id;
-            $data_key = $this->encode_key($max_id);
-            if ($this->set($data_key, [
-                'data' => $data,
-            ])) {
-                $this->meta_table->set($this->encode_key($key), [
-                    'id' => $max_id,
-                    //'prev' => $prev_id,
-                ]);
-                return TRUE;
-            }
-            return FALSE;
+    public function offsetGet($key) {
+        $index = $this->keyIndex($key);
+        return $this->table->get($index)['data'] ?? null;
+    }
+
+    public function offsetSet($key, $value) {
+        return $this->bulk(function () use ($key, $value) {
+            $index = $this->keyIndex($key);
+            $this->ext_size->add();
+            return $this->table->set($index, ['data' => json_encode($value, 320)]);
         });
     }
 
-
-    function find($key) {
-        return $this->do_lock(function () use ($key) {
-            $id = $this->meta_table->get($this->encode_key($key), 'id');
-            if ($id) {
-                $data_key = $this->encode_key($id);
-                $data     = $this->get($data_key, 'data');
-                $data     = json_decode($data, 1);
-                return $data;
+    public function offsetUnset($key) {
+        return $this->bulk(function () use ($key) {
+            $index = $this->keyIndex($key);
+            if ($this->table->del($index)) {
+                $this->ext_size->sub();
             }
-            return NULL;
         });
     }
 
-    function shift() {
-        // 如果 incr_min_id
-        return $this->do_lock(function () {
-            //log::info('sft', 'max=' . $this->get_max_id(), 'min=' . $this->get_min_id());
-            $min_id = $this->get_min_id();
-            while ($min_id <= $this->get_max_id()) {
-                //log::info('min_id=' . $min_id);
-                $data_key = $this->encode_key($min_id);
-                if (!$this->exist($data_key)) {
-                    $min_id = $this->incr_min_id();
-                    continue;
-                }
-                $data = $this->get($data_key, 'data');
-                $this->unset($min_id);
-                return json_decode($data, 1);
-            }
-            return NULL;
-        });
-    }
-
-    function pop() {
-        return $this->do_lock(function () {
-            //log::info('pop', 'max=' . $this->get_max_id(), 'min=' . $this->get_min_id());
-            $max_id = $this->get_max_id();
-            while ($max_id > 0 && $max_id >= $this->get_min_id()) {
-                $data_key = $this->encode_key($max_id);
-                if (!$this->exist($data_key)) {
-                    if ($max_id > 0) {
-                        $max_id = $this->decr_max_id();
-                        continue;
-                    }
-                    return NULL;
-                }
-                $data = $this->get($data_key, 'data');
-                $this->unset($max_id);
-                return json_decode($data, 1);
-            }
-            return NULL;
-        });
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function offsetExists($offset) {
-        return $this->meta_table->exist($this->encode_key($offset));
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function offsetGet($offset) {
-        $id = $this->meta_table->get($this->encode_key($offset), 'id');
-        if (!$id) {
-            return NULL;
+    private function keyIndex($key) {
+        if ($key === null) {
+            throw new InvalidArgumentException('Key can not be null.');
         }
-        $data = $this->get($this->encode_key($id), 'data');
-        return $data ? json_decode($data, 1) : NULL;
+        return '@' . $key;
     }
 
-    /**
-     * @inheritDoc
-     */
-    public function offsetSet($offset, $value) {
-        $id = $this->meta_table->get($this->encode_key($offset), 'id');
-        if (!$id) {
-            return NULL;
-        }
-        return $this->set($this->encode_key($id), [
-            'data' => json_encode($value, 320),
-        ]);
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function offsetUnset($offset) {
-        return $this->do_lock(function () use ($offset) {
-            return $this->unset($offset);
-        });
-    }
-
-    /**
-     * unset table
-     *
-     * @param $offset
-     *
-     * @return bool|null
-     */
-    public function unset($offset) {
-        $encode_key = $this->encode_key($offset);
-        $id         = $this->meta_table->get($encode_key, 'id');
-        if (!$id) {
-            return NULL;
-        }
-        $res = $this->del($this->encode_key($id));
-        $res += $this->meta_table->del($encode_key);
-        return $res;
+    private function queueIndex($id) {
+        return /*':' .*/ $id;
     }
 }
