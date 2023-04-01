@@ -36,6 +36,7 @@ class MProcess implements \Countable, \ArrayAccess {
     // process init(start in first child process)
     const EVENT_INIT = 'init';
 
+    const SLEEP_TIME = 1000;
 
     /**
      * MProcess constructor.
@@ -203,7 +204,7 @@ class MProcess implements \Countable, \ArrayAccess {
             if (!$this->process_list) {
                 break;
             }
-            usleep(500000);
+            usleep(static::SLEEP_TIME);
         }
         // done
         $this->trigger(static::EVENT_DONE, $this);
@@ -229,7 +230,7 @@ class MProcess implements \Countable, \ArrayAccess {
                         $is_done = 1;
                     }
                     // lower CPU time
-                    usleep(500000);
+                    usleep(static::SLEEP_TIME);
                     continue;
                 }
                 $callback($task_data, $index, $count);
@@ -245,7 +246,7 @@ class MProcess implements \Countable, \ArrayAccess {
     public function lock($callback) {
         try {
             while (!$this->locker->trylock()) {
-                usleep(500000);
+                usleep(static::SLEEP_TIME);
             }
             $res = $callback();
         } finally {
@@ -280,7 +281,7 @@ class MProcess implements \Countable, \ArrayAccess {
                     } elseif ($that->has(static::EVENT_INIT)) {
                         // wait index=0 process init
                         while ($that->atomic('_init') !== 2) {
-                            usleep(500000);
+                            usleep(static::SLEEP_TIME);
                         }
                     }
 
